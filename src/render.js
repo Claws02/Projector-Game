@@ -1,7 +1,7 @@
 // Canvas 2D renderer. Everything on the "wall" is drawn as shadow: dark, soft
 // shapes on a lit background, so a projector shows them as missing light.
 
-import { affineOf, applyH } from './mapping.js';
+import { applyH } from './mapping.js';
 import { Phase } from './game/round.js';
 
 const COLORS = {
@@ -15,8 +15,7 @@ const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 
 export function createRenderer(canvas) {
   const ctx = canvas.getContext('2d');
-  const maskCanvases = [];
-  let particles = [];
+    let particles = [];
   let W = 0;
   let H = 0;
 
@@ -39,7 +38,7 @@ export function createRenderer(canvas) {
         particles.push({ x: ev.x, y: ev.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
           r: ev.r * (0.15 + Math.random() * 0.2), life: 0.6, age: 0, color });
       }
-      particles.push({ text: `+${ev.coop ? ev.points * 2 : ev.points}`, x: ev.x, y: ev.y, vx: 0, vy: -0.15,
+      particles.push({ text: `+${ev.coop ? ev.points * 2 : ev.points}${ev.smash ? ' smash!' : ''}`, x: ev.x, y: ev.y, vx: 0, vy: -0.15,
         life: 0.9, age: 0, color: ev.coop ? COLORS.gold : COLORS.players[ev.player] });
     } else if (ev.type === 'expire') {
       particles.push({ x: ev.x, y: ev.y, vx: 0, vy: 0, r: ev.r, grow: true, life: 0.4, age: 0, color });
@@ -53,48 +52,98 @@ export function createRenderer(canvas) {
     ctx.fillRect(0, 0, W, H);
   }
 
-  function drawShadow(slot, Hm) {
-    const m = slot.det?.mask;
-    if (!m) return;
-    let mc = maskCanvases[slot.id];
-    if (!mc || mc.width !== m.w || mc.height !== m.h) {
-      mc = document.createElement('canvas');
-      mc.width = m.w;
-      mc.height = m.h;
-      mc.img = mc.getContext('2d').createImageData(m.w, m.h);
-      maskCanvases[slot.id] = mc;
-    }
-    const px4 = mc.img.data;
-    for (let k = 0; k < m.data.length; k++) {
-      px4[k * 4] = 18;
-      px4[k * 4 + 1] = 16;
-      px4[k * 4 + 2] = 14;
-      px4[k * 4 + 3] = Math.min(255, m.data[k] * 235);
-    }
-    mc.getContext('2d').putImageData(mc.img, 0, 0);
+  // Sharp shadows: resample every player's soft mask into one buffer at
+  // 1/k screen resolution, bilinear-interpolating the mask and thresholding with
+  // a narrow smoothstep. The edge follows the mask's sub-cell contour (no
+  // blockiness) and stays crisp at any scale. ~150k px per frame on a phone.
+  const SHADOW_RGB = (14 << 16) | (16 << 8) | 18; // little-endian ABGR: rgb(18,16,14)
+  let shadowCanvas = null;
+  let shadowImg = null;
 
-    // Soften edges on a small 4x canvas: blurring at screen size costs ~3x fps.
-    const UP = 4;
-    let soft = maskCanvases[`soft${slot.id}`];
-    if (!soft || soft.width !== m.w * UP || soft.height !== m.h * UP) {
-      soft = document.createElement('canvas');
-      soft.width = m.w * UP;
-      soft.height = m.h * UP;
-      maskCanvases[`soft${slot.id}`] = soft;
+  // Camera-space bounding box of a grid's occupied cells (plus one cell of margin),
+  // so the resampler can skip the empty parts of the screen.
+  function withBounds(g) {
+    let i0 = g.w;
+    let i1 = -1;
+    let j0 = g.h;
+    let j1 = -1;
+    for (let j = 0; j < g.h; j++) {
+      for (let i = 0; i < g.w; i++) {
+        if (g.data[j * g.w + i] <= 0.42) continue;
+        if (i < i0) i0 = i;
+        if (i > i1) i1 = i;
+        if (j < j0) j0 = j;
+        if (j > j1) j1 = j;
+      }
     }
-    const sctx = soft.getContext('2d');
-    sctx.clearRect(0, 0, soft.width, soft.height);
-    sctx.filter = 'blur(1.5px)'; // ignored where unsupported; bilinear upscale still softens
-    sctx.drawImage(mc, 0, 0, soft.width, soft.height);
-    sctx.filter = 'none';
+    return { ...g, u0: (i0 - 1) / g.w, u1: (i1 + 2) / g.w, v0: (j0 - 1) / g.h, v1: (j1 + 2) / g.h };
+  }
 
-    const { a, b, c, d, e, f } = affineOf(Hm);
-    const sw = soft.width;
-    const sh = soft.height;
-    ctx.imageSmoothingEnabled = true;
-    ctx.setTransform((W * a) / sw, (H * b) / sw, (W * c) / sh, (H * d) / sh, W * e, H * f);
-    ctx.drawImage(soft, 0, 0);
+  function drawShadows(slots, invH) {
+    const shapes = slots.map((s) => s.det?.shape ?? s.det?.mask).filter(Boolean).map(withBounds);
+    if (shapes.length === 0) return;
+    const k = Math.max(2, Math.ceil(Math.sqrt((W * H) / 150000)));
+    const w = Math.ceil(W / k);
+    const h = Math.ceil(H / k);
+    if (!shadowCanvas || shadowCanvas.width !== w || shadowCanvas.height !== h) {
+      shadowCanvas = document.createElement('canvas');
+      shadowCanvas.width = w;
+      shadowCanvas.height = h;
+      shadowImg = shadowCanvas.getContext('2d').createImageData(w, h);
+    }
+    const out = new Uint32Array(shadowImg.data.buffer);
+    out.fill(0);
+    // world-normalized (s, t) -> cam (u, v); affine in phone mode.
+    const n = invH[8];
+    const [ua, ub, uc, va, vb, vc] = [invH[0] / n, invH[1] / n, invH[2] / n, invH[3] / n, invH[4] / n, invH[5] / n];
+    for (let j = 0; j < h; j++) {
+      const t = (j + 0.5) / h;
+      for (let i = 0; i < w; i++) {
+        const s = (i + 0.5) / w;
+        const u = ua * s + ub * t + uc;
+        const v = va * s + vb * t + vc;
+        let val = 0;
+        for (const g of shapes) {
+          if (u < g.u0 || u > g.u1 || v < g.v0 || v > g.v1) continue;
+          // Inlined bilinear sample (see sampleBilinear in shadows.js).
+          const x = Math.min(g.w - 1, Math.max(0, u * g.w - 0.5));
+          const y = Math.min(g.h - 1, Math.max(0, v * g.h - 0.5));
+          const x0 = x | 0;
+          const y0 = y | 0;
+          const x1 = x0 + 1 < g.w ? x0 + 1 : x0;
+          const r0 = y0 * g.w;
+          const r1 = (y0 + 1 < g.h ? y0 + 1 : y0) * g.w;
+          const fx = x - x0;
+          const fy = y - y0;
+          const d = g.data;
+          const top = d[r0 + x0] + (d[r0 + x1] - d[r0 + x0]) * fx;
+          const bot = d[r1 + x0] + (d[r1 + x1] - d[r1 + x0]) * fx;
+          const sample = top + (bot - top) * fy;
+          if (sample > val) val = sample;
+        }
+        if (val <= 0.42) continue;
+        // smoothstep(0.42, 0.58, val): about one output pixel of anti-aliasing.
+        const e = val >= 0.58 ? 1 : (val - 0.42) / 0.16;
+        out[j * w + i] = (Math.round(e * e * (3 - 2 * e) * 235) << 24) | SHADOW_RGB;
+      }
+    }
+    shadowCanvas.getContext('2d').putImageData(shadowImg, 0, 0);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(shadowCanvas, 0, 0, W, H);
+  }
+
+  // Hand cursors: a ring at each palm in the player's color, filled while gripping.
+  function drawHands(hands) {
+    for (const hnd of hands) {
+      ctx.strokeStyle = COLORS.players[hnd.player];
+      ctx.fillStyle = COLORS.players[hnd.player];
+      ctx.lineWidth = px(0.008);
+      ctx.beginPath();
+      ctx.arc(px(hnd.x), px(hnd.y), px(hnd.grip ? 0.025 : 0.035), 0, Math.PI * 2);
+      if (hnd.grip) ctx.fill();
+      else ctx.stroke();
+    }
   }
 
   function drawPlayerMarker(slot, Hm, aspect) {
@@ -117,14 +166,26 @@ export function createRenderer(canvas) {
     const x = px(o.x);
     const y = px(o.y);
     const r = px(o.r) * (1 + 0.04 * Math.sin(time * 3 + o.phase));
-    const g = ctx.createRadialGradient(x, y, r * 0.2, x, y, r * 1.25);
-    g.addColorStop(0, `rgba(20,17,15,${0.92 * alpha})`);
-    g.addColorStop(0.75, `rgba(20,17,15,${0.75 * alpha})`);
-    g.addColorStop(1, 'rgba(20,17,15,0)');
-    ctx.fillStyle = g;
+    // Motion trail while a thrown orb is in flight.
+    if (time < o.thrownUntil) {
+      for (let k = 3; k >= 1; k--) {
+        ctx.fillStyle = `rgba(20,17,15,${0.12 * alpha * (4 - k)})`;
+        ctx.beginPath();
+        ctx.arc(x - px(o.vx) * 0.03 * k, y - px(o.vy) * 0.03 * k, r * (1 - k * 0.12), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.fillStyle = `rgba(20,17,15,${0.9 * alpha})`;
     ctx.beginPath();
-    ctx.arc(x, y, r * 1.25, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
+    if (o.heldBy) {
+      ctx.strokeStyle = COLORS.players[o.holder];
+      ctx.lineWidth = r * 0.15;
+      ctx.beginPath();
+      ctx.arc(x, y, r * 1.15, 0, Math.PI * 2);
+      ctx.stroke();
+    }
 
     if (o.kind === 'gold') {
       ctx.lineWidth = r * 0.18;
@@ -230,9 +291,13 @@ export function createRenderer(canvas) {
       }
     }
     const lines = [
-      `${s.stats.fps.toFixed(0)} fps · ${s.trackerName} ${s.stats.inferMs.toFixed(1)} ms`,
+      `${s.stats.fps.toFixed(0)} fps · ${s.trackerName} ${s.stats.inferMs.toFixed(1)} ms · draw ${s.stats.renderMs.toFixed(1)} ms`,
       `players ${s.playerCount} · phase ${s.round.phase} · orbs ${s.field.orbs.length}`,
     ];
+    if (s.hands) {
+      lines.push(`${s.handTrackerName} ${s.stats.handMs.toFixed(1)} ms`);
+      for (const hnd of s.hands) lines.push(`P${hnd.player + 1}${hnd.side} ${hnd.gesture}${hnd.grip ? ' (grip)' : ''}`);
+    }
     ctx.font = `500 ${Math.max(12, px(0.022))}px ui-monospace, monospace`;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
@@ -252,9 +317,10 @@ export function createRenderer(canvas) {
     },
     draw(s, dt) {
       drawWall(s.wake);
-      if (s.drawShadows) for (const slot of s.slots) drawShadow(slot, s.H);
+      if (s.drawShadows) drawShadows(s.slots, s.invH);
       for (const o of s.field.orbs) drawOrb(o, s.field.time);
       drawParticles(dt);
+      if (s.hands) drawHands(s.hands);
       if (s.round.phase !== Phase.ATTRACT) {
         for (const slot of s.slots) drawPlayerMarker(slot, s.H, s.aspect);
       }

@@ -8,7 +8,8 @@ import { Phase, createRound, stepRound } from './game/round.js';
 import { beginRound, createOrbField, stepOrbs } from './game/orbs.js';
 import { createRenderer } from './render.js';
 import { createAudio } from './audio.js';
-import { createSimTracker } from './tracker/sim.js';
+import { HandStates, palmsFromPose } from './handstate.js';
+import { createSimHandTracker, createSimTracker } from './tracker/sim.js';
 
 const STORE = { corners: 'projector-game.corners', best: 'projector-game.best' };
 
@@ -44,11 +45,26 @@ async function startCamera() {
 // Read live: phones swap the video's width/height when rotated.
 const cameraFrame = () => ({ width: video.videoWidth, height: video.videoHeight });
 
-async function createTracker() {
-  if (cfg.source === 'sim') return createSimTracker({ players: cfg.simPlayers });
-  setStatus('Loading vision model…');
-  const { createPoseTracker } = await import('./tracker/mediapipe.js');
-  return createPoseTracker({ maxPlayers: cfg.maxPlayers });
+async function createTrackers() {
+  if (cfg.source === 'sim') {
+    const pose = createSimTracker({ players: cfg.simPlayers });
+    return { pose, hands: cfg.hands ? createSimHandTracker(pose) : null };
+  }
+  setStatus('Loading vision models…');
+  const [{ createPoseTracker }, { createHandTracker }] = await Promise.all([
+    import('./tracker/mediapipe.js'),
+    import('./tracker/hands.js'),
+  ]);
+  const pose = await createPoseTracker({ maxPlayers: cfg.maxPlayers });
+  let hands = null;
+  if (cfg.hands) {
+    try {
+      hands = await createHandTracker();
+    } catch (err) {
+      console.warn('Hand tracking unavailable; continuing without it', err);
+    }
+  }
+  return { pose, hands };
 }
 
 // cam -> world homography for the current screen size.
@@ -79,9 +95,9 @@ async function start() {
   try {
     if (cfg.source === 'camera') await startCamera();
     if (cfg.calibrate && cfg.source === 'camera') return runCalibration(cameraFrame());
-    const tracker = await createTracker();
+    const trackers = await createTrackers();
     overlay.hidden = true;
-    runGame(tracker, cfg.source === 'sim' ? () => tracker.frame : cameraFrame);
+    runGame(trackers, cfg.source === 'sim' ? () => trackers.pose.frame : cameraFrame);
   } catch (err) {
     console.error(err);
     setStatus(`Couldn't start: ${err.message}`);
@@ -89,11 +105,14 @@ async function start() {
   }
 }
 
-function runGame(tracker, frameSize) {
+function runGame({ pose: tracker, hands: handTracker }, frameSize) {
   const slots = new PlayerSlots({ max: cfg.maxPlayers });
+  const handStates = new HandStates();
   const round = createRound({ roundSeconds: cfg.roundSeconds });
   const field = createOrbField();
-  const stats = { fps: 60, inferMs: 0 };
+  const stats = { fps: 60, inferMs: 0, handMs: 0, renderMs: 0 };
+  let handObs = [];
+  let freshFrames = 0;
   let H = IDENTITY;
   let invH = IDENTITY;
   let wake = 0;
@@ -131,6 +150,8 @@ function runGame(tracker, frameSize) {
     if (ev.type === 'pop') ev.kind === 'gold' ? audio.goldPop() : audio.pop(ev.player, ev.combo);
     else if (ev.type === 'goldTouch') audio.goldTouch(ev.player);
     else if (ev.type === 'nudge') audio.nudge();
+    else if (ev.type === 'grab') audio.grab(ev.player);
+    else if (ev.type === 'throw') audio.throw(ev.speed);
   }
 
   function frameLoop(nowMs) {
@@ -140,16 +161,31 @@ function runGame(tracker, frameSize) {
     if (dt > 0) stats.fps += (1 / dt - stats.fps) * 0.05;
 
     const t0 = performance.now();
-    const detections = tracker.detect(video);
+    const { detections, fresh } = tracker.detect(video);
     stats.inferMs += (performance.now() - t0 - stats.inferMs) * 0.1;
 
+    // Hand model on every other new camera frame: gestures don't need 30 Hz,
+    // and it halves the extra inference cost. Palm positions come from pose.
+    if (handTracker && fresh && freshFrames++ % 2 === 0) {
+      const t1 = performance.now();
+      handObs = handTracker.detect(video, detections);
+      stats.handMs += (performance.now() - t1 - stats.handMs) * 0.1;
+    }
+
     const aspect = renderer.aspect;
-    const world = detections.map((d) => {
-      const [s, t] = applyH(H, d.u, d.v);
-      return { ...d, x: s * aspect, y: t };
-    });
-    slots.update(world, now);
+    const toWorld = (u, v) => {
+      const [s, t] = applyH(H, u, v);
+      return { x: s * aspect, y: t };
+    };
+    slots.update(detections.map((d) => ({ ...d, ...toWorld(d.u, d.v) })), now);
     const playerCount = slots.activeCount;
+
+    const hands = handTracker
+      ? handStates.update(
+        palmsFromPose(slots.slots).map((p) => ({ ...p, ...toWorld(p.u, p.v) })),
+        handObs.map((o) => ({ ...o, ...toWorld(o.u, o.v) })),
+        now, dt)
+      : [];
 
     stepRound(round, { dt, present: playerCount > 0 }).forEach(onRoundEvent);
     if (round.phase === Phase.WAKING) {
@@ -159,16 +195,19 @@ function runGame(tracker, frameSize) {
     }
 
     const occ = occupancyFn(slots.slots, invH, aspect);
-    stepOrbs(field, { dt, aspect, occ, players: playerCount, scoring: round.phase === Phase.PLAYING })
+    stepOrbs(field, { dt, aspect, occ, players: playerCount, scoring: round.phase === Phase.PLAYING, hands })
       .forEach(onOrbEvent);
 
     wake += ((round.phase === Phase.ATTRACT ? 0 : 1) - wake) * Math.min(1, dt * 2.5);
 
+    const t2 = performance.now();
     renderer.draw({
-      round, field, slots: slots.slots, playerCount, H, aspect, wake, time: now,
+      round, field, slots: slots.slots, playerCount, H, invH, aspect, wake, time: now,
+      hands: handTracker ? hands : null, handTrackerName: handTracker?.name,
       best: round.phase === Phase.RESULTS ? bestBefore : best,
       drawShadows: cfg.drawShadows, debug: cfg.debug, stats, trackerName: tracker.name,
     }, dt);
+    stats.renderMs += (performance.now() - t2 - stats.renderMs) * 0.1;
     requestAnimationFrame(frameLoop);
   }
   requestAnimationFrame(frameLoop);

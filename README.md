@@ -14,6 +14,10 @@ see [docs/HARDWARE.md](docs/HARDWARE.md).
 - **60 s round:** pop orbs for points. Chaining pops quickly climbs a musical scale.
   - With 2 players, gold orbs only pop when **both** players touch them within about a second. That's worth 3 points each.
   - Solo, a gold orb pops on one touch for 3 points.
+- **Hands (on by default):**
+  - Make a **fist** near an orb to grab it. It follows your hand (a filled ring marks a gripping hand).
+  - **Open your hand** to throw it with your hand's speed.
+  - A thrown orb **smashes** every orb it hits for 2 points each. It also counts as your touch on a gold orb, so one player can throw while the other touches.
 - **Results:** the winner, the team total, and the best team score (stored on the device).
   If you stay, the next round starts. Walk away and the wall goes back to sleep.
 
@@ -38,7 +42,8 @@ npm run serve          # python3 -m http.server 8000
 | `mode=projector` | Uses the rear/USB camera, applies the calibrated corners, and doesn't draw shadows (your real shadow is the input) |
 | `calibrate=1` | Tap the 4 corners of the projected image in the camera view (projector mode) |
 | `source=sim&players=1\|2` | Simulated players instead of the camera |
-| `debug=1` | Shows fps, inference time and landmarks |
+| `hands=0` | Turns off hand tracking (saves one model's worth of compute) |
+| `debug=1` | Shows fps, inference/draw time, landmarks, and each hand's gesture |
 | `autostart=1` | Skips the Start tap (kiosk) |
 | `round=60` | Round length in seconds |
 | `mirror=0\|1`, `shadows=0\|1`, `cam=user\|environment` | Override the mode defaults |
@@ -49,7 +54,10 @@ npm run serve          # python3 -m http.server 8000
 index.html              page shell + start overlay
 src/main.js             frame loop: camera → tracker → players → game → render/audio
 src/config.js           URL options
+src/tracker/vision.js   shared MediaPipe loader (one WASM runtime for both models)
 src/tracker/mediapipe.js  MediaPipe Pose Landmarker (2 people + segmentation masks)
+src/tracker/hands.js    MediaPipe Gesture Recognizer on a 2x2 mosaic of wrist crops
+src/handstate.js        palm position/velocity per hand, grip with hysteresis
 src/tracker/sim.js      animated stick-figure players for dev/tests
 src/mapping.js          camera↔wall homography (phone cover-fit, projector 4-corner)
 src/shadows.js          mask grids → occ(x, y): "whose shadow is here?"

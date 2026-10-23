@@ -5,6 +5,7 @@
 //   ?source=sim          simulated players, no camera (desktop dev)
 //   ?players=1           number of simulated players
 //   ?calibrate=1         tap the 4 corners of the projected image (projector mode)
+//   ?hands=0             turn off hand tracking (fists grab and throw orbs)
 //   ?debug=1             fps, inference time, landmarks
 //   ?autostart=1         skip the tap-to-start screen (kiosk with autoplay allowed)
 //   ?round=60            round length in seconds
@@ -27,6 +28,7 @@ export function parseConfig(search) {
     drawShadows: flag('shadows', phone),
     facingMode: p.get('cam') === 'environment' || p.get('cam') === 'user' ? p.get('cam') : phone ? 'user' : 'environment',
     calibrate: flag('calibrate', false),
+    hands: flag('hands', true),
     debug: flag('debug', false),
     autostart: flag('autostart', false),
     roundSeconds: num('round', 60),

@@ -102,9 +102,60 @@ test('end to end: a simulated player scores points in a round', () => {
   const aspect = 640 / 480;
   for (let k = 0; k < 60 * 30; k++) {
     const t = k / 60;
-    const slots = sim.detect(null, t).map((det, id) => ({ id, det }));
+    const slots = sim.detect(null, t).detections.map((det, id) => ({ id, det }));
     const occ = occupancyFn(slots, IDENTITY, aspect);
     stepOrbs(f, { dt: 1 / 60, aspect, occ, players: 1, scoring: true });
   }
   assert.ok(f.scores[0] > 0, `expected some pops in 30 s, got ${f.scores[0]}`);
+});
+
+const fist = (x, y, extra = {}) => ({ key: '0R', player: 0, side: 'R', x, y, vx: 0, vy: 0, grip: true, ...extra });
+
+test('a fist grabs a nearby orb and carries it instead of popping it', () => {
+  const f = createOrbField({}, seeded());
+  beginRound(f);
+  const o = orbAt(f, 0.5, 0.5);
+  const events = stepOrbs(f, { dt: 1 / 60, aspect: 1, occ: disc(0, 0.5, 0.5), players: 1, scoring: true,
+    hands: [fist(0.52, 0.5)] });
+  assert.equal(events[0].type, 'grab');
+  assert.equal(o.heldBy, '0R');
+  assert.deepEqual(f.scores, [0, 0], 'held, not popped, even though the shadow covers it');
+
+  stepOrbs(f, { dt: 0.5, aspect: 1, occ: nobody, players: 1, scoring: true, hands: [fist(0.8, 0.3)] });
+  assert.ok(Math.hypot(o.x - 0.8, o.y - 0.3) < 0.01, 'follows the hand');
+});
+
+test('opening the hand throws the orb with the hand velocity, capped', () => {
+  const f = createOrbField({}, seeded());
+  beginRound(f);
+  const o = orbAt(f, 0.5, 0.5);
+  stepOrbs(f, { dt: 1 / 60, aspect: 1, occ: nobody, players: 1, scoring: true, hands: [fist(0.5, 0.5)] });
+  const events = stepOrbs(f, { dt: 1 / 60, aspect: 1, occ: nobody, players: 1, scoring: true,
+    hands: [fist(0.5, 0.5, { grip: false, vx: 10, vy: 0 })] });
+  assert.equal(events[0].type, 'throw');
+  assert.equal(o.heldBy, null);
+  assert.ok(o.vx > 2 && o.vx <= f.cfg.maxThrow + 0.01);
+  assert.equal(o.thrownBy, 0);
+});
+
+test('a thrown orb smashes the orbs it hits for 2 points', () => {
+  const f = createOrbField({}, seeded());
+  beginRound(f);
+  const target = orbAt(f, 0.7, 0.5);
+  const thrown = { ...target, id: 1, x: 0.6, vx: 2, thrownBy: 1, thrownUntil: Infinity };
+  f.orbs.push(thrown);
+  const events = stepOrbs(f, { dt: 1 / 60, aspect: 1, occ: nobody, players: 2, scoring: true });
+  const smash = events.find((e) => e.smash);
+  assert.ok(smash, 'smash event');
+  assert.equal(smash.player, 1);
+  assert.deepEqual(f.scores, [0, 2]);
+  assert.deepEqual(f.orbs.map((o) => o.id), [1], 'thrown orb flies on');
+});
+
+test('a fist never grabs a gold orb (gold stays a two-player touch)', () => {
+  const f = createOrbField({}, seeded());
+  beginRound(f);
+  const o = orbAt(f, 0.5, 0.5, 'gold');
+  stepOrbs(f, { dt: 1 / 60, aspect: 1, occ: nobody, players: 2, scoring: true, hands: [fist(0.5, 0.5)] });
+  assert.ok(!o.heldBy);
 });

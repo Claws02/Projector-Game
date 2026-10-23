@@ -64,6 +64,14 @@ export function createAudio() {
       tone(140 + Math.random() * 60, { type: 'sine', dur: 0.12, gain: 0.18, slide: 0.7 });
     },
 
+    grab(player) {
+      tone((BASE_HZ[player] ?? BASE_HZ[0]) / 2, { type: 'sine', dur: 0.1, gain: 0.25, slide: 1.3 });
+    },
+
+    throw(speed) {
+      tone(300 + Math.min(speed, 2.5) * 200, { type: 'sawtooth', dur: 0.22, gain: 0.07, slide: 0.4 });
+    },
+
     wake() {
       tone(110, { type: 'sine', dur: 1.6, gain: 0.25, slide: 4 });
       tone(165, { type: 'triangle', dur: 1.6, gain: 0.1, slide: 4, delay: 0.1 });
