@@ -8,7 +8,10 @@
 //   ?hands=0             turn off hand tracking (fists grab and throw orbs)
 //   ?debug=1             fps, inference time, landmarks
 //   ?autostart=1         skip the tap-to-start screen (kiosk with autoplay allowed)
-//   ?round=60            round length in seconds
+//   ?guide=1             open the pattern guide whenever the home screen wakes
+//   ?round=20            override every game's round length (testing)
+//   ?game=<id>           skip the home screen and loop one game (orbs, keepup, storm,
+//                        volley, smash, paint, simon)
 //   ?mirror=0|1  ?shadows=0|1  ?cam=user|environment   override mode defaults
 
 export function parseConfig(search) {
@@ -31,7 +34,9 @@ export function parseConfig(search) {
     hands: flag('hands', true),
     debug: flag('debug', false),
     autostart: flag('autostart', false),
-    roundSeconds: num('round', 60),
+    game: p.get('game') || null,
+    guide: flag('guide', false),
+    roundSeconds: num('round', 0),
     maxPlayers: 2,
   };
 }

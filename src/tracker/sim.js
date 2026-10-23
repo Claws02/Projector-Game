@@ -40,8 +40,20 @@ export function createSimTracker({ players = 2, gridW = 64, shapeW = 160, script
   };
 }
 
-// Fake hand model: each player's right hand closes into a fist for 1.2 s every
-// 3 s (grab, then throw as it swings), the left hand stays open.
+// Fake hand model: each player's right hand cycles through signs (a fist first,
+// so it grabs and then throws as the arm swings); the left hand stays open.
+const SIM_SIGNS = [['Closed_Fist', 1.2], ['Open_Palm', 1.2], ['Thumb_Up', 1.2], ['Victory', 1.2], ['Pointing_Up', 1.2]];
+const SIM_CYCLE = SIM_SIGNS.reduce((s, [, d]) => s + d, 0);
+
+export function simSign(t) {
+  let at = ((t % SIM_CYCLE) + SIM_CYCLE) % SIM_CYCLE;
+  for (const [sign, d] of SIM_SIGNS) {
+    if (at < d) return sign;
+    at -= d;
+  }
+  return 'None';
+}
+
 export function createSimHandTracker(sim) {
   return {
     name: 'sim-hands',
@@ -50,8 +62,8 @@ export function createSimHandTracker(sim) {
       detections.forEach((d, k) => {
         for (const [side, wrist] of [['L', 15], ['R', 16]]) {
           const p = d.landmarks[wrist];
-          const fist = side === 'R' && (sim.time + k) % 3 < 1.2;
-          out.push({ u: p.x, v: p.y, gesture: fist ? 'Closed_Fist' : 'Open_Palm', score: 0.9, landmarks: [] });
+          const gesture = side === 'R' ? simSign(sim.time + k * 2) : 'Open_Palm';
+          out.push({ u: p.x, v: p.y, gesture, score: 0.9, landmarks: [] });
         }
       });
       return out;

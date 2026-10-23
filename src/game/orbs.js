@@ -11,6 +11,8 @@
 // it with the hand's velocity. A thrown orb smashes other orbs it hits (2 points),
 // and counts as the thrower's touch on a gold orb.
 
+import { THROW_DEFAULTS, bounce, followHand, grabAndRelease, newBodyFields, range, sampleHits, wallBounce } from './physics.js';
+
 export const ORB_DEFAULTS = Object.freeze({
   spawnEvery: 0.9,
   maxOrbs: 7,
@@ -26,17 +28,8 @@ export const ORB_DEFAULTS = Object.freeze({
   bounceKick: 0.35,
   maxSpeed: 0.9,
   touchCooldown: 0.25,
-  grabReach: 0.05,     // how far outside an orb's edge a fist can grab it
-  throwGain: 1.2,
-  maxThrow: 2.5,
-  thrownFor: 1.5,      // s a thrown orb flies undamped and can smash others
+  ...THROW_DEFAULTS,
   smashPoints: 2,
-});
-
-const SAMPLES = 12;
-const DIRS = Array.from({ length: SAMPLES }, (_, k) => {
-  const a = (k / SAMPLES) * Math.PI * 2;
-  return [Math.cos(a), Math.sin(a)];
 });
 
 export function createOrbField(opts = {}, rng = Math.random) {
@@ -75,8 +68,8 @@ export function stepOrbs(f, { dt, aspect, occ, players, scoring, hands = [] }) {
     f.spawnIn = cfg.spawnEvery * (scoring ? 1 : 2.5);
   }
 
-  const handByKey = new Map(hands.map((h) => [h.key, h]));
-  grabAndRelease(f, hands, handByKey, events);
+  const handByKey = grabAndRelease(f.orbs, hands, f.time, events,
+    (o) => o.kind === 'normal' && o.age >= cfg.fadeIn, cfg);
 
   const keep = [];
   for (const o of f.orbs) {
@@ -84,12 +77,7 @@ export function stepOrbs(f, { dt, aspect, occ, players, scoring, hands = [] }) {
     o.cooldown = Math.max(0, o.cooldown - dt);
 
     if (o.heldBy) {
-      const h = handByKey.get(o.heldBy);
-      const k = Math.min(1, dt * 20);
-      o.x += (h.x - o.x) * k;
-      o.y += (h.y - o.y) * k;
-      o.vx = h.vx;
-      o.vy = h.vy;
+      followHand(o, handByKey.get(o.heldBy), dt);
       o.life = Math.max(o.life, o.age + 2); // never expires in hand
       keep.push(o);
       continue;
@@ -121,51 +109,6 @@ export function stepOrbs(f, { dt, aspect, occ, players, scoring, hands = [] }) {
   f.orbs = keep;
   smash(f, players, scoring, events);
   return events;
-}
-
-// Fists grab the nearest orb in reach; a held orb is thrown when its hand opens
-// (or disappears).
-function grabAndRelease(f, hands, handByKey, events) {
-  const { cfg } = f;
-  const holding = new Set();
-  for (const o of f.orbs) {
-    if (!o.heldBy) continue;
-    const h = handByKey.get(o.heldBy);
-    if (h && h.grip) {
-      holding.add(o.heldBy);
-      continue;
-    }
-    const vx = (h ?? o).vx * cfg.throwGain;
-    const vy = (h ?? o).vy * cfg.throwGain;
-    const speed = Math.hypot(vx, vy);
-    const k = speed > cfg.maxThrow ? cfg.maxThrow / speed : 1;
-    o.vx = vx * k;
-    o.vy = vy * k;
-    o.heldBy = null;
-    o.thrownBy = o.holder;
-    o.thrownUntil = f.time + cfg.thrownFor;
-    o.cooldown = 0.4; // don't let the thrower's own arm pop it on release
-    events.push({ type: 'throw', player: o.holder, x: o.x, y: o.y, speed: speed * k });
-  }
-
-  for (const h of hands) {
-    if (!h.grip || holding.has(h.key)) continue;
-    let target = null;
-    let bestGap = cfg.grabReach;
-    for (const o of f.orbs) {
-      if (o.heldBy || o.kind !== 'normal' || o.age < cfg.fadeIn) continue;
-      const gap = Math.hypot(o.x - h.x, o.y - h.y) - o.r;
-      if (gap <= bestGap) {
-        target = o;
-        bestGap = gap;
-      }
-    }
-    if (!target) continue;
-    target.heldBy = h.key;
-    target.holder = h.player;
-    holding.add(h.key);
-    events.push({ type: 'grab', player: h.player, x: target.x, y: target.y });
-  }
 }
 
 // Thrown orbs pop (or, outside a round, knock) the orbs they hit.
@@ -247,12 +190,8 @@ function spawnOrb(f, aspect, occ, scoring, players) {
       age: 0,
       life: scoring ? range(rng, cfg.life) : Infinity,
       phase: rng() * Math.PI * 2,
-      cooldown: 0,
       touchedAt: [-Infinity, -Infinity],
-      heldBy: null,
-      holder: -1,
-      thrownBy: -1,
-      thrownUntil: -Infinity,
+      ...newBodyFields(),
     };
   }
   return null;
@@ -275,53 +214,5 @@ function integrate(o, dt, aspect, cfg, free) {
 
   o.x += o.vx * dt;
   o.y += o.vy * dt;
-  if (o.x < o.r) { o.x = o.r; o.vx = Math.abs(o.vx); }
-  if (o.x > aspect - o.r) { o.x = aspect - o.r; o.vx = -Math.abs(o.vx); }
-  if (o.y < o.r) { o.y = o.r; o.vy = Math.abs(o.vy); }
-  if (o.y > 1 - o.r) { o.y = 1 - o.r; o.vy = -Math.abs(o.vy); }
-}
-
-// Returns null, or { player, nx, ny } where (nx, ny) points away from the shadow.
-function sampleHits(o, occ) {
-  const counts = [0, 0];
-  let nx = 0;
-  let ny = 0;
-  const center = occ(o.x, o.y);
-  if (center >= 0) counts[center] += 2;
-  for (const [dx, dy] of DIRS) {
-    const p = occ(o.x + dx * o.r, o.y + dy * o.r);
-    if (p < 0) continue;
-    counts[p] += 1;
-    nx -= dx;
-    ny -= dy;
-  }
-  if (counts[0] + counts[1] === 0) return null;
-  const len = Math.hypot(nx, ny);
-  return {
-    player: counts[1] > counts[0] ? 1 : 0,
-    nx: len > 0 ? nx / len : 0,
-    ny: len > 0 ? ny / len : -1,
-  };
-}
-
-function bounce(o, { nx, ny }, cfg) {
-  o.x += nx * o.r * 0.5;
-  o.y += ny * o.r * 0.5;
-  const vn = o.vx * nx + o.vy * ny;
-  if (vn < 0) {
-    o.vx -= 2 * vn * nx;
-    o.vy -= 2 * vn * ny;
-  }
-  o.vx += nx * cfg.bounceKick;
-  o.vy += ny * cfg.bounceKick;
-  const speed = Math.hypot(o.vx, o.vy);
-  if (speed > cfg.maxSpeed) {
-    o.vx *= cfg.maxSpeed / speed;
-    o.vy *= cfg.maxSpeed / speed;
-  }
-  o.cooldown = cfg.touchCooldown;
-}
-
-function range(rng, [lo, hi]) {
-  return lo + rng() * (hi - lo);
+  wallBounce(o, aspect);
 }

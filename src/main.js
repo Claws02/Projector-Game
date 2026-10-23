@@ -4,14 +4,16 @@ import { parseConfig } from './config.js';
 import { IDENTITY, applyH, coverFit, homographyFromCorners, invertH } from './mapping.js';
 import { PlayerSlots } from './players.js';
 import { occupancyFn } from './shadows.js';
-import { Phase, createRound, stepRound } from './game/round.js';
-import { beginRound, createOrbField, stepOrbs } from './game/orbs.js';
+import { Phase, createFlow, exitToHome, selectGame, stepFlow } from './game/flow.js';
+import { availableGames, gameById } from './games/index.js';
+import { createHome, openGuide, stepHome } from './home.js';
 import { createRenderer } from './render.js';
 import { createAudio } from './audio.js';
 import { HandStates, palmsFromPose } from './handstate.js';
 import { createSimHandTracker, createSimTracker } from './tracker/sim.js';
 
-const STORE = { corners: 'projector-game.corners', best: 'projector-game.best' };
+const STORE = { corners: 'projector-game.corners', best: (id) => `projector-game.best.${id}` };
+const EXIT_HOLD = 2;
 
 const cfg = parseConfig(location.search);
 const canvas = document.getElementById('stage');
@@ -106,18 +108,23 @@ async function start() {
 }
 
 function runGame({ pose: tracker, hands: handTracker }, frameSize) {
+  const handModel = Boolean(handTracker);
   const slots = new PlayerSlots({ max: cfg.maxPlayers });
   const handStates = new HandStates();
-  const round = createRound({ roundSeconds: cfg.roundSeconds });
-  const field = createOrbField();
+  const flow = createFlow();
+  const home = createHome(availableGames(handModel), { handModel });
+  const rng = Math.random;
   const stats = { fps: 60, inferMs: 0, handMs: 0, renderMs: 0 };
-  let handObs = [];
-  let freshFrames = 0;
+  const exitHold = [0, 0];
   let H = IDENTITY;
   let invH = IDENTITY;
   let wake = 0;
-  let best = load(STORE.best) ?? 0;
-  let bestBefore = best;
+  let game = null;
+  let gameState = null;
+  let result = null;
+  let bestBefore = 0;
+  let handObs = [];
+  let freshFrames = 0;
   let lastCount = 0;
   let last = performance.now() / 1000;
 
@@ -130,28 +137,73 @@ function runGame({ pose: tracker, hands: handTracker }, frameSize) {
   window.addEventListener('resize', remap);
   video.addEventListener('resize', remap);
 
-  function onRoundEvent(ev) {
-    if (ev === 'wake') audio.wake();
-    else if (ev === 'sleep') audio.sleep();
-    else if (ev === 'tick') audio.tick();
-    else if (ev === 'roundStart') {
-      beginRound(field);
+  function startGame(id) {
+    const g = gameById(id);
+    if (!g || !selectGame(flow, id, cfg.roundSeconds || g.duration)) return;
+    game = g;
+    gameState = g.create({ aspect: renderer.aspect, rng, players: slots.activeCount, handModel });
+    audio.select();
+  }
+
+  function onFlowEvent(ev) {
+    if (ev === 'wake' || ev === 'home') {
+      if (ev === 'wake') audio.wake();
+      game = null;
+      if (cfg.game) startGame(cfg.game); // ?game=<id>: skip the home screen
+      else if (cfg.guide) openGuide(home);
+    } else if (ev === 'sleep') {
+      audio.sleep();
+      game = null;
+    } else if (ev === 'tick') {
+      audio.tick();
+    } else if (ev === 'roundStart') {
       audio.countdown(0);
     } else if (ev === 'roundEnd') {
-      const team = field.scores[0] + field.scores[1];
-      bestBefore = best;
-      if (team > best) save(STORE.best, (best = team));
+      result = game.result(gameState, slots.activeCount);
+      bestBefore = load(STORE.best(game.id)) ?? 0;
+      if (result.value !== null && result.value > bestBefore) save(STORE.best(game.id), result.value);
       audio.roundEnd();
     }
   }
 
-  function onOrbEvent(ev) {
+  function onEvent(ev) {
     renderer.emit(ev);
-    if (ev.type === 'pop') ev.kind === 'gold' ? audio.goldPop() : audio.pop(ev.player, ev.combo);
-    else if (ev.type === 'goldTouch') audio.goldTouch(ev.player);
-    else if (ev.type === 'nudge') audio.nudge();
-    else if (ev.type === 'grab') audio.grab(ev.player);
-    else if (ev.type === 'throw') audio.throw(ev.speed);
+    switch (ev.type) {
+      case 'pop': ev.kind === 'gold' ? audio.goldPop() : audio.pop(ev.player, ev.combo); break;
+      case 'goldTouch': audio.goldTouch(ev.player); break;
+      case 'nudge': audio.nudge(); break;
+      case 'grab': audio.grab(ev.player); break;
+      case 'throw': audio.throw(ev.speed); break;
+      case 'bounce': audio.bounce(ev.count); break;
+      case 'hit': audio.hit(); break;
+      case 'miss': audio.miss(); break;
+      case 'score': audio.score(ev.player); break;
+      case 'prompt': audio.prompt(); break;
+      case 'correct': audio.correct(ev.player); break;
+      case 'wrong': audio.wrong(); break;
+      case 'guide': audio.guide(); break;
+      case 'select': startGame(ev.id); break;
+    }
+  }
+
+  // Both hands held still above the head for EXIT_HOLD seconds leaves the game.
+  function checkExit(hands, toWorld, dt) {
+    let progress = 0;
+    for (const slot of slots.slots) {
+      const head = slot.det?.landmarks?.[0];
+      const mine = hands.filter((h) => h.player === slot.id);
+      const up = head && mine.length === 2 && mine.every((h) =>
+        h.y < toWorld(head.x, head.y).y - 0.03 && Math.hypot(h.vx, h.vy) < 0.4);
+      exitHold[slot.id] = up ? exitHold[slot.id] + dt : 0;
+      progress = Math.max(progress, exitHold[slot.id] / EXIT_HOLD);
+    }
+    if (progress >= 1 && exitToHome(flow)) {
+      exitHold.fill(0);
+      game = null;
+      audio.exit();
+      return 0;
+    }
+    return progress;
   }
 
   function frameLoop(nowMs) {
@@ -178,34 +230,38 @@ function runGame({ pose: tracker, hands: handTracker }, frameSize) {
       return { x: s * aspect, y: t };
     };
     slots.update(detections.map((d) => ({ ...d, ...toWorld(d.u, d.v) })), now);
-    const playerCount = slots.activeCount;
+    const players = slots.activeCount;
+    const hands = handStates.update(
+      palmsFromPose(slots.slots).map((p) => ({ ...p, ...toWorld(p.u, p.v) })),
+      handObs.map((o) => ({ ...o, ...toWorld(o.u, o.v) })),
+      now, dt);
+    const bodies = slots.slots.filter((sl) => sl.active).map((sl) => ({ player: sl.id, x: sl.x, y: sl.y }));
+    const occ = occupancyFn(slots.slots, invH, aspect);
+    const input = { dt, time: now, aspect, occ, hands, bodies, players, rng };
 
-    const hands = handTracker
-      ? handStates.update(
-        palmsFromPose(slots.slots).map((p) => ({ ...p, ...toWorld(p.u, p.v) })),
-        handObs.map((o) => ({ ...o, ...toWorld(o.u, o.v) })),
-        now, dt)
-      : [];
-
-    stepRound(round, { dt, present: playerCount > 0 }).forEach(onRoundEvent);
-    if (round.phase === Phase.WAKING) {
-      const n = Math.ceil(round.countdown - round.phaseTime);
+    stepFlow(flow, { dt, present: players > 0 }).forEach(onFlowEvent);
+    if (flow.phase === Phase.COUNTDOWN) {
+      const n = Math.ceil(flow.countdown - flow.phaseTime);
       if (n !== lastCount && n > 0) audio.countdown(n);
       lastCount = n;
     }
 
-    const occ = occupancyFn(slots.slots, invH, aspect);
-    stepOrbs(field, { dt, aspect, occ, players: playerCount, scoring: round.phase === Phase.PLAYING, hands })
-      .forEach(onOrbEvent);
+    if (flow.phase === Phase.ATTRACT || flow.phase === Phase.HOME) {
+      stepHome(home, input, { active: flow.phase === Phase.HOME }).forEach(onEvent);
+    } else if (flow.phase === Phase.PLAYING) {
+      game.step(gameState, input).forEach(onEvent);
+    }
+    const inGame = flow.phase === Phase.COUNTDOWN || flow.phase === Phase.PLAYING || flow.phase === Phase.RESULTS;
+    const exitProgress = inGame ? checkExit(hands, toWorld, dt) : 0;
 
-    wake += ((round.phase === Phase.ATTRACT ? 0 : 1) - wake) * Math.min(1, dt * 2.5);
+    wake += ((flow.phase === Phase.ATTRACT ? 0 : 1) - wake) * Math.min(1, dt * 2.5);
 
     const t2 = performance.now();
     renderer.draw({
-      round, field, slots: slots.slots, playerCount, H, invH, aspect, wake, time: now,
-      hands: handTracker ? hands : null, handTrackerName: handTracker?.name,
-      best: round.phase === Phase.RESULTS ? bestBefore : best,
-      drawShadows: cfg.drawShadows, debug: cfg.debug, stats, trackerName: tracker.name,
+      flow, home, game, gameState, result, bestBefore, players, slots: slots.slots, hands,
+      H, invH, aspect, wake, time: now, exitProgress,
+      drawShadows: cfg.drawShadows, debug: cfg.debug, stats,
+      trackerName: tracker.name, handTrackerName: handTracker?.name,
     }, dt);
     stats.renderMs += (performance.now() - t2 - stats.renderMs) * 0.1;
     requestAnimationFrame(frameLoop);
