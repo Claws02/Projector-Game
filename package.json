@@ -1,0 +1,11 @@
+{
+  "name": "projector-game",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shadow Wall: a camera + projector game where your shadow plays with projected objects.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "serve": "python3 -m http.server 8000"
+  }
+}
