@@ -64,6 +64,56 @@ export function createAudio() {
       tone(140 + Math.random() * 60, { type: 'sine', dur: 0.12, gain: 0.18, slide: 0.7 });
     },
 
+    grab(player) {
+      tone((BASE_HZ[player] ?? BASE_HZ[0]) / 2, { type: 'sine', dur: 0.1, gain: 0.25, slide: 1.3 });
+    },
+
+    throw(speed) {
+      tone(300 + Math.min(speed, 2.5) * 200, { type: 'sawtooth', dur: 0.22, gain: 0.07, slide: 0.4 });
+    },
+
+    bounce(count) {
+      tone(note(329.63, count % PENTA.length), { type: 'sine', dur: 0.14, gain: 0.25, slide: 1.2 });
+    },
+
+    hit() {
+      tone(90, { type: 'sawtooth', dur: 0.3, gain: 0.18, slide: 0.6 });
+    },
+
+    miss() {
+      tone(330, { type: 'triangle', dur: 0.35, gain: 0.15, slide: 0.5 });
+    },
+
+    score(player) {
+      [0, 7].forEach((st, k) => tone((BASE_HZ[player] ?? BASE_HZ[0]) * 2 ** (st / 12),
+        { type: 'triangle', dur: 0.2, gain: 0.22, delay: k * 0.08 }));
+    },
+
+    prompt() {
+      tone(660, { type: 'sine', dur: 0.12, gain: 0.15 });
+    },
+
+    correct(player) {
+      tone((BASE_HZ[player] ?? BASE_HZ[0]) * 2, { type: 'triangle', dur: 0.2, gain: 0.25, slide: 1.25 });
+    },
+
+    wrong() {
+      tone(150, { type: 'square', dur: 0.25, gain: 0.08, slide: 0.7 });
+    },
+
+    select() {
+      [0, 4, 7, 12, 16].forEach((st, k) =>
+        tone(392 * 2 ** (st / 12), { type: 'triangle', dur: 0.3, gain: 0.18, delay: k * 0.05 }));
+    },
+
+    guide() {
+      tone(523.25, { type: 'sine', dur: 0.2, gain: 0.15, slide: 1.5 });
+    },
+
+    exit() {
+      tone(523.25, { type: 'triangle', dur: 0.5, gain: 0.18, slide: 0.5 });
+    },
+
     wake() {
       tone(110, { type: 'sine', dur: 1.6, gain: 0.25, slide: 4 });
       tone(165, { type: 'triangle', dur: 1.6, gain: 0.1, slide: 4, delay: 0.1 });

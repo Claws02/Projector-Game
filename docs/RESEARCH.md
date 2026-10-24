@@ -106,3 +106,37 @@ Camera ─▶ Vision process ─▶ (camera→projector homography) ─▶ input
 2. **Sense:** players/hands/blobs in camera space → map through H into game space.
 3. **Play:** the game receives normalized events (`hit(x,y)`, `players[]`, `silhouette mask`),
    so you can swap the sensor without touching game code.
+
+## Hand tracking (added 2026-10-23)
+
+**Chosen: [MediaPipe Gesture Recognizer](https://ai.google.dev/edge/mediapipe/solutions/vision/gesture_recognizer)**
+from google-ai-edge/mediapipe (30k+★, Apache-2.0).
+- **Output:** 21 landmarks per hand, handedness, and 7 built-in gestures (Closed_Fist, Open_Palm, Pointing_Up, Thumb_Up, Thumb_Down, Victory, ILoveYou).
+- **Why:** it ships in the same `@mediapipe/tasks-vision` package as the pose model, so there's no new dependency, it shares one WASM runtime, and it runs on the phone's GPU.
+
+**The distance problem and the workaround:**
+- **[inference]** At full-body distance, a hand is about 30–40 px in a 640×480 frame, which is too small for the palm detector.
+- **[fact]** The recognizer rejects region-of-interest input.
+- So `src/tracker/hands.js` crops a square around each wrist (sized from the forearm length the pose model reports), packs up to 4 crops into a 384×384 2×2 mosaic, and runs one inference per frame.
+- It runs on every other camera frame. Palm *position* comes from the pose model every frame; the hand model only supplies the *gesture*.
+
+| Alternative | ~Stars | Why not (yet) |
+|---|---|---|
+| [open-mmlab/mmpose](https://github.com/open-mmlab/mmpose) RTMPose / RTMW | 6k+ | Whole-body 133 keypoints including hands, likely better at distance **[assumption]**. Needs an ONNX Runtime Web / WebGPU port and is heavier. **First fallback if the crop approach is flaky on device.** |
+| [tensorflow/tfjs-models](https://github.com/tensorflow/tfjs-models) hand-pose-detection | 14k | Wraps the same MediaPipe Hands model in an older runtime. No gain. |
+| [ultralytics/ultralytics](https://github.com/ultralytics/ultralytics) hand-keypoints | 40k+ | Python-first, and AGPL-3.0 is a problem for a public portfolio or product. |
+| [CMU openpose](https://github.com/CMU-Perceptual-Computing-Lab/openpose) hands | 30k+ | Non-commercial license, heavy. |
+| [victordibia/handtrack.js](https://github.com/victordibia/handtrack.js) | 2.5k+ | Bounding boxes only, no fingers or gestures. |
+| HaMeR / WiLoR (3D hand mesh research) | – | GPU research models, not real-time on a phone. |
+
+### What hands unlock (design backlog)
+
+| Gesture / signal | Mechanic | Status |
+|---|---|---|
+| Closed_Fist → open | Grab and throw orbs; thrown orbs smash others | **Built** |
+| Open_Palm | Force push / shield that repels orbs, or blocks an opponent's throw | Idea |
+| Pointing_Up + index tip | Aim reticle: hold it on a target to charge it, or a shadow "laser" | Idea |
+| Thumb_Up / Victory | Hands-free menus: choose a game mode, "play again", with no touch or keyboard | Idea, high value |
+| Index tip trail | Finger-paint with shadow ink, or draw walls that orbs bounce off | Idea |
+| Pinch (thumb–index distance) | Pick up small, precise objects | Idea |
+| Custom gestures | Recognize **hand shadow puppets** (dog, bird, rabbit) and bring them to life. MediaPipe Model Maker can train custom gesture classes from a few hundred images. | Stretch |
