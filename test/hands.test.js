@@ -16,10 +16,8 @@ test('grip needs a sustained fist and survives a single misread frame', () => {
   step('Closed_Fist');
   assert.equal(step('Closed_Fist').grip, true);
   assert.equal(step('Open_Palm').grip, true, 'one open frame does not release');
-  step('Open_Palm');
-  step('Open_Palm');
-  step('Open_Palm');
-  assert.equal(step('Open_Palm').grip, false);
+  for (let k = 0; k < 4; k++) step('Open_Palm');
+  assert.equal(step('Open_Palm').grip, false, 'a sustained open hand releases');
 });
 
 test('gestures match the nearest palm and expire', () => {
@@ -63,4 +61,14 @@ test('box downsample keeps fractional edges and bilinear sampling interpolates t
   assert.deepEqual([...g.data.slice(0, 4)], [1, 0.5, 0, 0]);
   assert.equal(sampleBilinear(g, 0.25, 0.5), 0.75, 'halfway between cell centers 1 and 0.5');
   assert.equal(sampleBilinear(g, -0.5, 0.5), 0);
+});
+
+test('one misread gesture frame does not change the voted gesture', () => {
+  const hs = new HandStates({ votes: 3 });
+  let t = 0;
+  const step = (g) => hs.update([palm(0.5, 0.5)], [obs(0.5, 0.5, g)], (t += 1 / 15), 1 / 15)[0];
+  step('Victory');
+  step('Victory');
+  assert.equal(step('Thumb_Up').gesture, 'Victory');
+  assert.equal(step('Thumb_Up').gesture, 'Thumb_Up');
 });

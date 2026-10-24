@@ -94,6 +94,9 @@ function figurePose(k, t) {
   const pt = ([x, y]) => ({ x, y, visibility: 1 });
   const landmarks = [];
   landmarks[0] = pt(head);
+  // Torso: shoulders 11/12, hips 23/24.
+  [[11, left.shoulder], [12, right.shoulder], [23, [u - 0.03, 0.6]], [24, [u + 0.03, 0.6]]]
+    .forEach(([i, p]) => { landmarks[i] = pt(p); });
   // Pose indices: 13/14 elbows, 15/16 wrists, 17-20 pinky/index (at the hand).
   [[13, left.elbow], [14, right.elbow], [15, left.hand], [16, right.hand],
     [17, left.hand], [18, right.hand], [19, left.hand], [20, right.hand]]

@@ -5,7 +5,7 @@ import { createSimHandTracker, createSimTracker } from '../src/tracker/sim.js';
 import { occupancyFn } from '../src/shadows.js';
 import { IDENTITY } from '../src/mapping.js';
 import { HandStates, palmsFromPose } from '../src/handstate.js';
-import { PlayerSlots } from '../src/players.js';
+import { PlayerTracks } from '../src/tracks.js';
 
 function seeded(seed = 3) {
   return () => ((seed = (seed * 16807) % 2147483647) - 1) / 2147483646;
@@ -25,21 +25,26 @@ function run(game, { players = 2, seconds = 30 } = {}) {
   const rng = seeded();
   const sim = createSimTracker({ players, gridW: 32, shapeW: 32, script: [[0, Infinity], [0, Infinity]].slice(0, players) });
   const simHands = createSimHandTracker(sim);
-  const slots = new PlayerSlots();
+  const tracks = new PlayerTracks();
   const handStates = new HandStates();
   const state = game.create({ aspect, rng, players, handModel: true });
   const events = [];
-  const dt = 1 / 30;
-  for (let i = 0; i < seconds * 30; i++) {
+  const dt = 1 / 60; // render rate; the camera (sim) delivers samples at 30 Hz
+  const world = (u, v) => ({ x: u * aspect, y: v });
+  for (let i = 0; i < seconds * 60; i++) {
     const t = i * dt;
-    const { detections } = sim.detect(null, t);
-    const world = (u, v) => ({ x: u * aspect, y: v });
-    slots.update(detections.map((d) => ({ ...d, ...world(d.u, d.v) })), t);
-    const obs = simHands.detect(null, detections).map((o) => ({ ...o, ...world(o.u, o.v) }));
-    const hands = handStates.update(palmsFromPose(slots.slots).map((p) => ({ ...p, ...world(p.u, p.v) })), obs, t, dt);
-    const bodies = slots.slots.filter((s) => s.active).map((s) => ({ player: s.id, x: s.x, y: s.y }));
-    const occ = occupancyFn(slots.slots, IDENTITY, aspect);
-    events.push(...game.step(state, { dt, time: t, aspect, occ, hands, bodies, players, rng }));
+    let obs = [];
+    if (i % 2 === 0) {
+      const { detections } = sim.detect(null, t);
+      tracks.ingest({ time: t, detections });
+      if (i % 4 === 0) obs = simHands.detect(null, detections).map((o) => ({ ...o, ...world(o.u, o.v) }));
+    }
+    const slots = tracks.update(t, dt).map((sl) => (sl.active ? { ...sl, ...world(sl.u, sl.v) } : sl));
+    const hands = handStates.update(palmsFromPose(slots).map((p) => ({ ...p, ...world(p.u, p.v) })), obs, t, dt);
+    const bodies = slots.filter((s) => s.active).map((s) => ({ player: s.id, x: s.x, y: s.y }));
+    const occ = occupancyFn(slots, IDENTITY, aspect);
+    const active = slots.filter((s) => s.active).length;
+    events.push(...game.step(state, { dt, time: t, aspect, occ, hands, bodies, players: active, rng }));
   }
   return { state, events };
 }

@@ -4,7 +4,8 @@
 // Position comes from pose landmarks every frame (smooth, always available).
 // Gesture comes from the hand model, which may run less often and miss frames,
 // so it is matched to the nearest palm and held for a short time-to-live.
-// Grip uses hysteresis so a single misclassified frame doesn't drop an orb.
+// Gestures are decided by a vote over the last few readings, and grip adds
+// hysteresis on top, so a single misclassified frame never drops an orb.
 
 const ARM = {
   L: [15, 17, 19], // wrist, pinky, index
@@ -32,12 +33,13 @@ export function palmsFromPose(slots) {
 }
 
 export class HandStates {
-  constructor({ gripOn = 0.08, gripOff = 0.15, matchDist = 0.15, gestureTtl = 0.35 } = {}) {
-    Object.assign(this, { gripOn, gripOff, matchDist, gestureTtl });
+  constructor({ gripOn = 0.08, gripOff = 0.15, matchDist = 0.15, gestureTtl = 0.35, votes = 3 } = {}) {
+    Object.assign(this, { gripOn, gripOff, matchDist, gestureTtl, votes });
     this.states = new Map();
   }
 
-  // palms: [{ player, side, x, y }] world units. observations: [{ x, y, gesture, score }].
+  // palms: [{ player, side, x, y }] world units, every frame.
+  // observations: [{ x, y, gesture, score }], only on frames with a new hand-model reading.
   // Returns the hands present this frame.
   update(palms, observations, now, dt) {
     const seen = new Set();
@@ -47,7 +49,7 @@ export class HandStates {
       let s = this.states.get(key);
       if (!s) {
         s = { key, player: p.player, side: p.side, x: p.x, y: p.y, vx: 0, vy: 0,
-          gesture: 'None', gestureAt: -Infinity, grip: false, fistFor: 0, openFor: 0 };
+          gesture: 'None', gestureAt: -Infinity, recent: [], grip: false, fistFor: 0, openFor: 0 };
         this.states.set(key, s);
       } else if (dt > 0) {
         const k = 0.5;
@@ -72,7 +74,9 @@ export class HandStates {
         }
       }
       if (best) {
-        best.gesture = o.gesture;
+        best.recent.push({ gesture: o.gesture, score: o.score ?? 1 });
+        if (best.recent.length > this.votes) best.recent.shift();
+        best.gesture = vote(best.recent);
         best.gestureAt = now;
       }
     }
@@ -83,7 +87,10 @@ export class HandStates {
         this.states.delete(key);
         continue;
       }
-      if (now - s.gestureAt > this.gestureTtl) s.gesture = 'None';
+      if (now - s.gestureAt > this.gestureTtl) {
+        s.gesture = 'None';
+        s.recent = [];
+      }
       if (s.gesture === 'Closed_Fist') {
         s.fistFor += dt;
         s.openFor = 0;
@@ -97,4 +104,13 @@ export class HandStates {
     }
     return out;
   }
+}
+
+// Score-weighted majority; ties go to the most recent reading.
+function vote(recent) {
+  const tally = new Map();
+  for (const r of recent) tally.set(r.gesture, (tally.get(r.gesture) ?? 0) + r.score);
+  let best = recent.at(-1).gesture;
+  for (const [g, w] of tally) if (w > tally.get(best)) best = g;
+  return best;
 }

@@ -40,6 +40,7 @@ npm run serve          # python3 -m http.server 8000
 | `calibrate=1` | Tap the 4 corners of the projected image in the camera view (projector mode) |
 | `source=sim&players=1\|2` | Simulated players instead of the camera |
 | `hands=0` | Turns off hand tracking (saves one model's worth of compute) |
+| `model=lite\|full`, `worker=0`, `delegate=cpu`, `gpu=0` | Tracking and rendering switches; see [docs/TRACKING.md](docs/TRACKING.md) |
 | `debug=1` | Shows fps, inference/draw time, landmarks, and each hand's gesture |
 | `autostart=1` | Skips the Start tap (kiosk) |
 | `game=<id>` | Skips the home screen and loops one game (`orbs keepup storm volley smash paint simon`) |
@@ -51,16 +52,21 @@ npm run serve          # python3 -m http.server 8000
 
 ```
 index.html              page shell + start overlay
-src/main.js             frame loop: camera → tracker → players → game → render/audio
+src/main.js             60 Hz loop: pipeline → tracks → hands → flow/home/game → render/audio
 src/config.js           URL options
-src/tracker/vision.js   shared MediaPipe loader (one WASM runtime for both models)
+src/tracker/pipeline.js camera frames → worker (or main thread) → samples; sim pipeline
+src/tracker/worker.js   tracking Web Worker
+src/tracker/engine.js   runs pose + hand models on one frame (worker or main)
+src/tracker/vision.js   shared MediaPipe loader (works in workers too)
 src/tracker/mediapipe.js  MediaPipe Pose Landmarker (2 people + segmentation masks)
 src/tracker/hands.js    MediaPipe Gesture Recognizer on a 2x2 mosaic of wrist crops
-src/handstate.js        palm position/velocity per hand, grip with hysteresis
+src/tracks.js           player tracks: confirm, dedupe, match, coast, filter, blend masks
+src/filters.js          One Euro filter
+src/handstate.js        palm position/velocity per hand, gesture vote, grip hysteresis
+src/shadowgl.js         WebGL wall + crisp player shadows
 src/tracker/sim.js      animated stick-figure players for dev/tests
 src/mapping.js          camera↔wall homography (phone cover-fit, projector 4-corner)
 src/shadows.js          mask grids → occ(x, y): "whose shadow is here?"
-src/players.js          stable P1/P2 identity across frames
 src/game/flow.js        attract → home → countdown → playing → results
 src/game/patterns.js    portal start patterns (dwell, punch, bounceUp, twoTouch, grabThrow, gesture)
 src/game/physics.js     shared shadow collision, bounce, grab/throw
@@ -70,5 +76,5 @@ src/game/orbs.js        orb field used by Orb Pop
 src/render.js           Canvas 2D drawing + `kit` helpers for games (everything is drawn as shadow)
 src/audio.js            synthesized Web Audio effects (no asset files)
 test/                   node:test unit tests
-docs/                   research notes and hardware plan
+docs/                   research, hardware plan, games guide, tracking pipeline
 ```
