@@ -7,7 +7,7 @@
 // pack up to 4 crops into a 2x2 mosaic, and run the recognizer once on that.
 // The model does not support region-of-interest input, hence the manual crop.
 
-import { createWithFallback, loadVision } from './vision.js';
+import { createWithFallback, loadVision, makeCanvas } from './vision.js';
 
 const MODEL =
   'https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task';
@@ -52,9 +52,9 @@ export function mosaicToCam(p, rois, vw, vh, q = (p.x >= 0.5 ? 1 : 0) + (p.y >= 
   return { q, x: (r.x + lx * r.size) / vw, y: (r.y + ly * r.size) / vh };
 }
 
-export async function createHandTracker() {
+export async function createHandTracker({ delegate = 'auto' } = {}) {
   const { mod, fileset } = await loadVision();
-  const { task, delegate } = await createWithFallback((d) =>
+  const { task, delegate: used } = await createWithFallback((d) =>
     mod.GestureRecognizer.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: MODEL, delegate: d },
       runningMode: 'VIDEO',
@@ -62,34 +62,31 @@ export async function createHandTracker() {
       minHandDetectionConfidence: 0.4,
       minHandPresenceConfidence: 0.4,
       minTrackingConfidence: 0.4,
-    }));
+    }), delegate);
 
-  const mosaic = document.createElement('canvas');
-  mosaic.width = mosaic.height = CELL * 2;
+  const mosaic = makeCanvas(CELL * 2, CELL * 2);
   const ctx = mosaic.getContext('2d');
   let lastTs = 0;
 
   return {
-    name: `hands-${delegate}`,
+    name: `hands-${used}`,
     mosaic,
 
     // Returns hand observations in camera space:
     // [{ u, v, gesture, score, landmarks: [{x, y}] }]
-    detect(video, detections) {
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
+    // image: video, ImageBitmap or canvas of size vw x vh; ts: ms.
+    detect(image, vw, vh, detections, ts) {
       const rois = handRois(detections, vw, vh);
       if (rois.length === 0) return [];
 
       ctx.fillStyle = '#000';
       ctx.fillRect(0, 0, mosaic.width, mosaic.height);
       rois.forEach((r, q) => {
-        ctx.drawImage(video, r.x, r.y, r.size, r.size, (q % 2) * CELL, Math.floor(q / 2) * CELL, CELL, CELL);
+        ctx.drawImage(image, r.x, r.y, r.size, r.size, (q % 2) * CELL, Math.floor(q / 2) * CELL, CELL, CELL);
       });
 
-      const ts = Math.max(lastTs + 1, performance.now());
-      lastTs = ts;
-      const res = task.recognizeForVideo(mosaic, ts);
+      lastTs = Math.max(lastTs + 1, ts);
+      const res = task.recognizeForVideo(mosaic, lastTs);
 
       const out = [];
       res.landmarks.forEach((lms, k) => {
@@ -102,7 +99,10 @@ export async function createHandTracker() {
           v: center.y,
           gesture: g?.categoryName || 'None',
           score: g?.score ?? 0,
-          landmarks: lms.map((p) => mosaicToCam(p, rois, vw, vh, center.q)),
+          landmarks: lms.map((p) => {
+            const c = mosaicToCam(p, rois, vw, vh, center.q);
+            return { x: c.x, y: c.y };
+          }),
         });
       });
       return out;

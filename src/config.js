@@ -6,6 +6,10 @@
 //   ?players=1           number of simulated players
 //   ?calibrate=1         tap the 4 corners of the projected image (projector mode)
 //   ?hands=0             turn off hand tracking (fists grab and throw orbs)
+//   ?model=lite|full     pose model (default: full, auto-switching to lite if too slow)
+//   ?worker=0            run tracking on the main thread instead of a worker
+//   ?delegate=cpu        run the vision models on the CPU (WASM) instead of the GPU
+//   ?gpu=0               draw shadows on the CPU instead of WebGL
 //   ?debug=1             fps, inference time, landmarks
 //   ?autostart=1         skip the tap-to-start screen (kiosk with autoplay allowed)
 //   ?guide=1             open the pattern guide whenever the home screen wakes
@@ -32,6 +36,10 @@ export function parseConfig(search) {
     facingMode: p.get('cam') === 'environment' || p.get('cam') === 'user' ? p.get('cam') : phone ? 'user' : 'environment',
     calibrate: flag('calibrate', false),
     hands: flag('hands', true),
+    model: ['lite', 'full'].includes(p.get('model')) ? p.get('model') : 'auto',
+    worker: flag('worker', true) ? 'auto' : 'off',
+    delegate: p.get('delegate') === 'cpu' ? 'cpu' : 'auto',
+    gpu: flag('gpu', true),
     debug: flag('debug', false),
     autostart: flag('autostart', false),
     game: p.get('game') || null,

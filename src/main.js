@@ -1,8 +1,12 @@
-// Entry point: camera -> tracker -> players -> game -> renderer/audio, every frame.
+// Entry point. Every render frame (60 Hz):
+//   pipeline.poll -> new tracking sample? -> PlayerTracks (filter, coast, blend)
+//   -> hands -> flow/home/game -> renderer + audio
+// Tracking samples arrive at camera rate from a worker; everything the player
+// sees is smoothed and extrapolated to render time.
 
 import { parseConfig } from './config.js';
 import { IDENTITY, applyH, coverFit, homographyFromCorners, invertH } from './mapping.js';
-import { PlayerSlots } from './players.js';
+import { PlayerTracks } from './tracks.js';
 import { occupancyFn } from './shadows.js';
 import { Phase, createFlow, exitToHome, selectGame, stepFlow } from './game/flow.js';
 import { availableGames, gameById } from './games/index.js';
@@ -10,7 +14,7 @@ import { createHome, openGuide, stepHome } from './home.js';
 import { createRenderer } from './render.js';
 import { createAudio } from './audio.js';
 import { HandStates, palmsFromPose } from './handstate.js';
-import { createSimHandTracker, createSimTracker } from './tracker/sim.js';
+import { createCameraPipeline, createSimPipeline } from './tracker/pipeline.js';
 
 const STORE = { corners: 'projector-game.corners', best: (id) => `projector-game.best.${id}` };
 const EXIT_HOLD = 2;
@@ -22,7 +26,7 @@ const overlay = document.getElementById('overlay');
 const statusEl = document.getElementById('status');
 const startBtn = document.getElementById('start');
 
-const renderer = createRenderer(canvas);
+const renderer = createRenderer(canvas, cfg.gpu ? document.getElementById('wallgl') : null);
 const audio = createAudio();
 
 const setStatus = (msg) => { statusEl.textContent = msg; };
@@ -38,7 +42,7 @@ async function startCamera() {
   if (!window.isSecureContext) throw new Error('Camera needs HTTPS (or localhost). Open the GitHub Pages URL.');
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: false,
-    video: { facingMode: cfg.facingMode, width: { ideal: 640 }, height: { ideal: 480 } },
+    video: { facingMode: cfg.facingMode, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
   });
   video.srcObject = stream;
   await video.play();
@@ -47,26 +51,13 @@ async function startCamera() {
 // Read live: phones swap the video's width/height when rotated.
 const cameraFrame = () => ({ width: video.videoWidth, height: video.videoHeight });
 
-async function createTrackers() {
-  if (cfg.source === 'sim') {
-    const pose = createSimTracker({ players: cfg.simPlayers });
-    return { pose, hands: cfg.hands ? createSimHandTracker(pose) : null };
-  }
+async function createPipeline() {
+  if (cfg.source === 'sim') return createSimPipeline({ players: cfg.simPlayers, hands: cfg.hands });
   setStatus('Loading vision models…');
-  const [{ createPoseTracker }, { createHandTracker }] = await Promise.all([
-    import('./tracker/mediapipe.js'),
-    import('./tracker/hands.js'),
-  ]);
-  const pose = await createPoseTracker({ maxPlayers: cfg.maxPlayers });
-  let hands = null;
-  if (cfg.hands) {
-    try {
-      hands = await createHandTracker();
-    } catch (err) {
-      console.warn('Hand tracking unavailable; continuing without it', err);
-    }
-  }
-  return { pose, hands };
+  return createCameraPipeline(video, {
+    worker: cfg.worker, model: cfg.model, delegate: cfg.delegate, hands: cfg.hands, maxPlayers: cfg.maxPlayers,
+    onStatus: (msg) => console.info(msg),
+  });
 }
 
 // cam -> world homography for the current screen size.
@@ -97,9 +88,9 @@ async function start() {
   try {
     if (cfg.source === 'camera') await startCamera();
     if (cfg.calibrate && cfg.source === 'camera') return runCalibration(cameraFrame());
-    const trackers = await createTrackers();
+    const pipeline = await createPipeline();
     overlay.hidden = true;
-    runGame(trackers, cfg.source === 'sim' ? () => trackers.pose.frame : cameraFrame);
+    runGame(pipeline, cfg.source === 'sim' ? () => pipeline.frame : cameraFrame);
   } catch (err) {
     console.error(err);
     setStatus(`Couldn't start: ${err.message}`);
@@ -107,14 +98,17 @@ async function start() {
   }
 }
 
-function runGame({ pose: tracker, hands: handTracker }, frameSize) {
-  const handModel = Boolean(handTracker);
-  const slots = new PlayerSlots({ max: cfg.maxPlayers });
+function runGame(pipeline, frameSize) {
+  const handModel = Boolean(pipeline.handName);
+  const tracks = new PlayerTracks({ max: cfg.maxPlayers });
+  let slots = [];
+  let players = 0;
   const handStates = new HandStates();
   const flow = createFlow();
   const home = createHome(availableGames(handModel), { handModel });
   const rng = Math.random;
-  const stats = { fps: 60, inferMs: 0, handMs: 0, renderMs: 0 };
+  const stats = { fps: 60, camFps: 0, inferMs: 0, handMs: 0, renderMs: 0 };
+  let lastSampleAt = 0;
   const exitHold = [0, 0];
   let H = IDENTITY;
   let invH = IDENTITY;
@@ -123,10 +117,19 @@ function runGame({ pose: tracker, hands: handTracker }, frameSize) {
   let gameState = null;
   let result = null;
   let bestBefore = 0;
-  let handObs = [];
-  let freshFrames = 0;
   let lastCount = 0;
   let last = performance.now() / 1000;
+
+  // Debug hook for automated browser checks (?debug=1 only).
+  if (cfg.debug) {
+    window.__shadowWall = {
+      stats, shadowPath: renderer.shadowPath,
+      get pipeline() { return pipeline.name; },
+      get hands() { return pipeline.handName; },
+      get players() { return players; },
+      get phase() { return flow.phase; },
+    };
+  }
 
   const remap = () => {
     renderer.resize();
@@ -141,7 +144,7 @@ function runGame({ pose: tracker, hands: handTracker }, frameSize) {
     const g = gameById(id);
     if (!g || !selectGame(flow, id, cfg.roundSeconds || g.duration)) return;
     game = g;
-    gameState = g.create({ aspect: renderer.aspect, rng, players: slots.activeCount, handModel });
+    gameState = g.create({ aspect: renderer.aspect, rng, players, handModel });
     audio.select();
   }
 
@@ -159,7 +162,7 @@ function runGame({ pose: tracker, hands: handTracker }, frameSize) {
     } else if (ev === 'roundStart') {
       audio.countdown(0);
     } else if (ev === 'roundEnd') {
-      result = game.result(gameState, slots.activeCount);
+      result = game.result(gameState, players);
       bestBefore = load(STORE.best(game.id)) ?? 0;
       if (result.value !== null && result.value > bestBefore) save(STORE.best(game.id), result.value);
       audio.roundEnd();
@@ -189,7 +192,7 @@ function runGame({ pose: tracker, hands: handTracker }, frameSize) {
   // Both hands held still above the head for EXIT_HOLD seconds leaves the game.
   function checkExit(hands, toWorld, dt) {
     let progress = 0;
-    for (const slot of slots.slots) {
+    for (const slot of slots) {
       const head = slot.det?.landmarks?.[0];
       const mine = hands.filter((h) => h.player === slot.id);
       const up = head && mine.length === 2 && mine.every((h) =>
@@ -212,31 +215,32 @@ function runGame({ pose: tracker, hands: handTracker }, frameSize) {
     last = now;
     if (dt > 0) stats.fps += (1 / dt - stats.fps) * 0.05;
 
-    const t0 = performance.now();
-    const { detections, fresh } = tracker.detect(video);
-    stats.inferMs += (performance.now() - t0 - stats.inferMs) * 0.1;
-
-    // Hand model on every other new camera frame: gestures don't need 30 Hz,
-    // and it halves the extra inference cost. Palm positions come from pose.
-    if (handTracker && fresh && freshFrames++ % 2 === 0) {
-      const t1 = performance.now();
-      handObs = handTracker.detect(video, detections);
-      stats.handMs += (performance.now() - t1 - stats.handMs) * 0.1;
+    // New tracking sample (camera rate)? Feed the tracks.
+    let handObs = [];
+    const sample = pipeline.poll(now);
+    if (sample) {
+      tracks.ingest(sample);
+      if (sample.handObs) handObs = sample.handObs;
+      stats.inferMs += (sample.inferMs - stats.inferMs) * 0.1;
+      if (sample.handObs) stats.handMs += (sample.handMs - stats.handMs) * 0.2;
+      if (lastSampleAt) stats.camFps += (1 / Math.max(1e-3, sample.time - lastSampleAt) - stats.camFps) * 0.1;
+      lastSampleAt = sample.time;
     }
 
+    // Smoothed, extrapolated players at render time, mapped to the wall.
     const aspect = renderer.aspect;
     const toWorld = (u, v) => {
       const [s, t] = applyH(H, u, v);
       return { x: s * aspect, y: t };
     };
-    slots.update(detections.map((d) => ({ ...d, ...toWorld(d.u, d.v) })), now);
-    const players = slots.activeCount;
+    slots = tracks.update(now, dt).map((sl) => (sl.active ? { ...sl, ...toWorld(sl.u, sl.v) } : sl));
+    players = slots.filter((sl) => sl.active).length;
     const hands = handStates.update(
-      palmsFromPose(slots.slots).map((p) => ({ ...p, ...toWorld(p.u, p.v) })),
+      palmsFromPose(slots).map((p) => ({ ...p, ...toWorld(p.u, p.v) })),
       handObs.map((o) => ({ ...o, ...toWorld(o.u, o.v) })),
       now, dt);
-    const bodies = slots.slots.filter((sl) => sl.active).map((sl) => ({ player: sl.id, x: sl.x, y: sl.y }));
-    const occ = occupancyFn(slots.slots, invH, aspect);
+    const bodies = slots.filter((sl) => sl.active).map((sl) => ({ player: sl.id, x: sl.x, y: sl.y }));
+    const occ = occupancyFn(slots, invH, aspect);
     const input = { dt, time: now, aspect, occ, hands, bodies, players, rng };
 
     stepFlow(flow, { dt, present: players > 0 }).forEach(onFlowEvent);
@@ -258,10 +262,10 @@ function runGame({ pose: tracker, hands: handTracker }, frameSize) {
 
     const t2 = performance.now();
     renderer.draw({
-      flow, home, game, gameState, result, bestBefore, players, slots: slots.slots, hands,
+      flow, home, game, gameState, result, bestBefore, players, slots, hands,
       H, invH, aspect, wake, time: now, exitProgress,
       drawShadows: cfg.drawShadows, debug: cfg.debug, stats,
-      trackerName: tracker.name, handTrackerName: handTracker?.name,
+      trackerName: pipeline.name, handTrackerName: pipeline.handName,
     }, dt);
     stats.renderMs += (performance.now() - t2 - stats.renderMs) * 0.1;
     requestAnimationFrame(frameLoop);

@@ -7,6 +7,7 @@
 import { applyH } from './mapping.js';
 import { Phase } from './game/flow.js';
 import { drawHome } from './home.js';
+import { createShadowGL } from './shadowgl.js';
 
 const COLORS = {
   wallLit: [239, 230, 216],
@@ -21,8 +22,11 @@ const COLORS = {
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 const TAU = Math.PI * 2;
 
-export function createRenderer(canvas) {
+// glCanvas (optional): a canvas layered under `canvas` for the GPU wall + shadows.
+export function createRenderer(canvas, glCanvas = null) {
   const ctx = canvas.getContext('2d');
+  const glr = glCanvas ? createShadowGL(glCanvas) : null;
+  if (glCanvas && !glr) glCanvas.hidden = true;
   let particles = [];
   let W = 0;
   let H = 0;
@@ -32,6 +36,7 @@ export function createRenderer(canvas) {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = canvas.width = Math.round(canvas.clientWidth * dpr);
     H = canvas.height = Math.round(canvas.clientHeight * dpr);
+    glr?.resize(W, H);
   }
 
   // World units -> device pixels: height is 1 world unit, so the scale is H.
@@ -263,11 +268,18 @@ export function createRenderer(canvas) {
     ctx.globalAlpha = 1;
   }
 
-  function drawWall(wake) {
-    const c = COLORS.wallDim.map((d, i) => Math.round(d + (COLORS.wallLit[i] - d) * wake));
+  // Wall + player shadows: on the GPU layer when available, else on this canvas.
+  function drawWallAndShadows(s) {
+    const wall = COLORS.wallDim.map((d, i) => Math.round(d + (COLORS.wallLit[i] - d) * s.wake));
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = `rgb(${c})`;
+    if (glr) {
+      ctx.clearRect(0, 0, W, H);
+      glr.draw({ wall, slots: s.slots, invH: s.invH, drawShadows: s.drawShadows });
+      return;
+    }
+    ctx.fillStyle = `rgb(${wall})`;
     ctx.fillRect(0, 0, W, H);
+    if (s.drawShadows) drawShadows(s.slots, s.invH);
   }
 
   // Sharp shadows: resample every player's soft mask into one buffer at
@@ -298,7 +310,8 @@ export function createRenderer(canvas) {
   }
 
   function drawShadows(slots, invH) {
-    const shapes = slots.map((s) => s.det?.shape ?? s.det?.mask).filter(Boolean).map(withBounds);
+    const shapes = slots.filter((s) => (s.det?.alpha ?? 1) >= 0.5)
+      .map((s) => s.det?.shape ?? s.det?.mask).filter(Boolean).map(withBounds);
     if (shapes.length === 0) return;
     const k = Math.max(2, Math.ceil(Math.sqrt((W * H) / 150000)));
     const w = Math.ceil(W / k);
@@ -413,7 +426,8 @@ export function createRenderer(canvas) {
       }
     }
     const lines = [
-      `${s.stats.fps.toFixed(0)} fps · ${s.trackerName} ${s.stats.inferMs.toFixed(1)} ms · draw ${s.stats.renderMs.toFixed(1)} ms`,
+      `${s.stats.fps.toFixed(0)} fps · draw ${s.stats.renderMs.toFixed(1)} ms · shadows ${glr ? 'gpu' : 'cpu'}`,
+      `${s.trackerName} · ${s.stats.camFps.toFixed(0)} Hz · ${s.stats.inferMs.toFixed(1)} ms`,
       `players ${s.players} · ${s.flow.phase}${s.game ? ` · ${s.game.id}` : ''}`,
     ];
     if (s.handTrackerName) lines.push(`${s.handTrackerName} ${s.stats.handMs.toFixed(1)} ms`);
@@ -436,10 +450,10 @@ export function createRenderer(canvas) {
     get aspect() {
       return W / H;
     },
+    shadowPath: glr ? 'gpu' : 'cpu',
     draw(s, dt) {
       time = s.time;
-      drawWall(s.wake);
-      if (s.drawShadows) drawShadows(s.slots, s.invH);
+      drawWallAndShadows(s);
       const { phase } = s.flow;
       if (phase === Phase.ATTRACT || phase === Phase.HOME) {
         drawHome(s.home, kit, { active: phase === Phase.HOME });
